@@ -1,0 +1,72 @@
+"""Recreates the Q6.3 / Q6.4 / Q6.5 figures from a trained checkpoint.
+
+Usage:
+    python make_figures.py --ckpt model.pt --data_path ./data/train/ --out results
+"""
+import argparse, os
+import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from torchvision import utils as vutils
+from torch.utils.data import DataLoader
+
+from unet import Unet
+from diffusion import Diffusion
+from trainer import Dataset
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--ckpt", default="model.pt")
+parser.add_argument("--data_path", default="./data/train/")
+parser.add_argument("--out", default="results")
+args = parser.parse_args()
+os.makedirs(args.out, exist_ok=True)
+
+torch.manual_seed(2024)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = Unet(dim=16, dim_mults=[1, 2, 4, 8]).to(device)
+d = Diffusion(model, image_size=32, channels=3, timesteps=50).to(device)
+d.load_state_dict(torch.load(args.ckpt, map_location=device)["model"])
+d.eval()
+
+def to01(x):
+    return (x.clamp(-1, 1) + 1) / 2
+
+vutils.save_image(vutils.make_grid(d.sample(32), nrow=8, padding=2),
+                  os.path.join(args.out, "q6_3_generated_cats.png"))
+
+ds = Dataset(args.data_path, 32, "cat", augment=True)
+x0 = next(iter(DataLoader(ds, batch_size=32, shuffle=True, num_workers=2, drop_last=True))).to(device)
+noise = torch.randn_like(x0)
+pcts = [0, 25, 50, 75, 99]
+ts = [int(p / 100 * d.num_timesteps) for p in pcts]
+
+fwd = []
+for t in ts:
+    xt = d.q_sample(x0, torch.full((x0.shape[0],), t, device=device, dtype=torch.long), noise)
+    fwd.append(to01(xt))
+
+x = xt
+bwd = {}
+with torch.no_grad():
+    for t in range(d.num_timesteps - 1, -1, -1):
+        x = d.p_sample(x, torch.full((x.shape[0],), t, device=device, dtype=torch.long), t)
+        if t in ts:
+            bwd[t] = to01(x)
+
+def rows_fig(batches, labels, title, fname):
+    fig, axes = plt.subplots(len(batches), 1, figsize=(10, 2 * len(batches)))
+    for ax, b, l in zip(axes, batches, labels):
+        ax.imshow(vutils.make_grid(b[:8].cpu(), nrow=8, padding=1).permute(1, 2, 0).numpy())
+        ax.set_ylabel(l, rotation=0, labelpad=45, va="center")
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(title)
+    fig.savefig(fname, dpi=150, bbox_inches="tight")
+
+rows_fig(fwd, [f"t={t} ({p}%)" for t, p in zip(ts, pcts)], "Forward diffusion",
+         os.path.join(args.out, "q6_4_forward.png"))
+rows_fig([bwd[t] for t in reversed(ts)],
+         [f"t={t} ({p}%)" for t, p in zip(reversed(ts), reversed(pcts))],
+         "Backward diffusion (99% to 0%)", os.path.join(args.out, "q6_5_backward.png"))
+print("saved figures to", args.out)
